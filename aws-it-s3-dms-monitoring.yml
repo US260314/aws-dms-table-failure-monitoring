@@ -1,0 +1,49 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation Template: Create a Secure S3 Bucket'
+
+Parameters:
+  pEnvironment:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: Environment Type
+    Default: environment
+    
+Resources:
+  DMSMonitoringS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${pEnvironment}-s3-dms-monitoring"
+      Tags:
+        - Key: environment
+          Value: !Ref pEnvironment
+        - Key: application
+          Value: edw
+        - Key: team
+          Value: dma
+        - Key: application-id
+          Value: tbd
+        - Key: cost-center
+          Value: tbd
+        - Key: sensitive-data
+          Value: none
+        - Key: s3-access
+          Value: private
+        - Key: dr-tier
+          Value: 2      
+        - Key: macie-enrolled
+          Value: exclude            
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: "Suspended"
+
+Outputs:
+  BucketName:
+    Description: "DMS Monitoring S3 bucket"
+    Value: !Ref DMSMonitoringS3Bucket
