@@ -1,0 +1,11 @@
+{
+    "dmstask": [
+        "arn:aws:service:region:123456789:resource",
+		"arn:aws:service:region:123456789:resource",
+		"arn:aws:service:region:123456789:resource",
+		"arn:aws:service:region:123456789:resource",
+		"arn:aws:service:region:123456789:resource",
+		"arn:aws:service:region:123456789:resource",
+		"arn:aws:service:region:123456789:resource"
+    ]
+}

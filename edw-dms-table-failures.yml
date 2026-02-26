@@ -1,0 +1,250 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS DMS Tasks Monitoring for table failures'
+
+Parameters:
+  pEnvironment:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Description: Environment Type
+    Default: environment
+    
+  EmailAddress:
+    Type: String
+    Description: Email address to subscribe to SNS topic for notifications
+    Default: 'aca_dba_dw@example.com'
+    
+  LambdaTimeout:
+    Type: Number
+    Description: Timeout for Lambda function in seconds
+    Default: 900
+    
+  DMSLogGroupName:
+    Type: String
+    Description: DMS Log Group name to read DMS Log Streams
+        
+Conditions:
+  IsPrimary:  !Equals [!Ref AWS::Region, "us-east-1"]
+  IsDR:  !Equals [!Ref AWS::Region, "us-east-2"]
+    
+Resources:
+  DMSMonitoringIAMRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "edw-${pEnvironment}-dms-monitoring"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+          - Effect: 'Allow'
+            Principal:
+              Service: 'events.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: !Sub "edw-${pEnvironment}-dms-monitoring"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'sns:Publish'
+                Resource: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:edw-${pEnvironment}-dms-monitoring"
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogStreams'
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:GetLogEvents'
+                  - 'logs:FilterLogEvents'                  
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*:*"
+              - Effect: 'Allow'
+                Action:
+                  - 'dms:DescribeReplicationTasks'
+                Resource: "*"
+                
+  DMSMonitoringLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Condition: IsPrimary
+    Properties:
+      Handler: 'index.lambda_handler'
+      Role: !GetAtt DMSMonitoringIAMRole.Arn
+      FunctionName: !Sub "edw-${pEnvironment}-dms-monitoring"
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import logging
+          from datetime import datetime, timedelta
+
+          # Set up logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              # Initialize the DMS, CloudWatch Logs, and SNS clients
+              dms = boto3.client('dms')
+              # Initialize the CloudWatch Logs client
+              cloudwatch_logs = boto3.client('logs')
+              sns = boto3.client('sns')
+ 
+              # Retrieve environment variables 
+              log_group_name = os.environ['LOG_GROUP_NAME']
+              sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+              search_text = 'Failed'
+              
+              logger.info(f"Environment variables: LOG_GROUP_NAME={log_group_name}, SNS_TOPIC_ARN={sns_topic_arn}")
+              
+              try:
+                  if not log_group_name or not sns_topic_arn:
+                      raise ValueError("Environment variables LOG_GROUP_NAME and SNS_TOPIC_ARN must be set.")
+                  
+                  # Fetch ongoing replication DMS tasks
+                  try:
+                      dms_tasks = []
+                      response = dms.describe_replication_tasks()
+                      for task in response['ReplicationTasks']:
+                          if task['Status'] == 'running' and task['MigrationType'] in ['full-load-and-cdc']:
+                              dms_tasks.append(task['ReplicationTaskArn'])                    
+                  except Exception as e:
+                      raise ValueError(f"Error fetching DMS tasks: {str(e)}")    
+                 
+                  logger.info(f"DMS Task ARNs retrieved: {dms_tasks}")
+                  
+                  matching_logs = []
+                  for dms_task_arn in dms_tasks:
+                      task_identifier = dms_task_arn.split(':')[-1].split('/')[-1]
+                      log_stream_name = f"dms-task-{task_identifier}"
+                      logger.info(f"Processing log stream: {log_stream_name}")
+                      
+                      next_token = None
+                      more_logs = True
+                      while more_logs:
+                          logger.info(f"Fetching log events for log stream: {log_stream_name} with next token: {next_token}")
+                          
+                          try:
+                              if next_token:
+                                  response = cloudwatch_logs.get_log_events(
+                                      logGroupName=log_group_name,
+                                      logStreamName=log_stream_name,
+                                      startTime=int((datetime.now() - timedelta(minutes=30)).timestamp() * 1000),
+                                      endTime=int(datetime.now().timestamp() * 1000),
+                                      startFromHead=True,
+                                      nextToken=next_token
+                                  )
+                              else:    
+                                  response = cloudwatch_logs.get_log_events(
+                                      logGroupName=log_group_name,
+                                      logStreamName=log_stream_name,
+                                      startTime=int((datetime.now() - timedelta(minutes=30)).timestamp() * 1000),
+                                      endTime=int(datetime.now().timestamp() * 1000),
+                                      startFromHead=True
+                                  )    
+                          except cloudwatch_logs.exceptions.ResourceNotFoundException:  
+                              logger.error(f"Log stream {log_stream_name} not found.")
+                              break
+                                                                
+                          events = response['events']
+                          next_token = response.get('nextForwardToken')
+                          
+                          for event in events:
+                              if search_text in event['message']:
+                                 matching_logs.append({
+                                     'dms_task_arn': dms_task_arn,
+                                     'log_stream_name': log_stream_name,
+                                     'message': event['message']
+                                 })
+                                 logger.info(f"Found '{search_text}' in {log_stream_name}: {event['message']}")
+                                          
+                          more_logs = 'nextForwardToken' in response and next_token != response['nextForwardToken']
+                              
+                  if matching_logs:
+                      message_lines = [f"DMS Task ARN: {log['dms_task_arn']}\nLog Stream: {log['log_stream_name']}\nMatching Log Entry: {log['message']}\n" for log in matching_logs]
+                      message = 'Text "{}" found in log streams:\n\n'.format(search_text) + '\n\n'.join(message_lines)
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject= !Sub "edw-${pEnvironment}-dms-tasks-table-failures",
+                          Message=message
+                      )
+                      notification_message = 'Notification sent'
+                  else:
+                      notification_message = 'Text not found in any log stream.'
+              
+                  return {
+                      'statusCode': 200,
+                      'body': notification_message
+                  }
+               
+              except Exception as e: 
+                  logger.error(f"Error occurred: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': str(e)
+                  }
+             
+      Runtime: python3.9
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref DMSMonitoringSNSTopic
+          LOG_GROUP_NAME: !Ref DMSLogGroupName
+          
+  DMSMonitoringLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Condition: IsPrimary
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt DMSMonitoringLambdaFunction.Arn
+      Principal: 'events.amazonaws.com'
+      SourceArn: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/edw-${pEnvironment}-dms-monitoring'
+      
+  DMSMonitoringEventRule:
+    Type: AWS::Events::Rule
+    Condition: IsPrimary 
+    Properties: 
+      Name: !Sub "edw-${pEnvironment}-dms-monitoring"
+      Description: Cloudwatch event rule to trigger DMS Tasks Table Failures Monitoring Lambda function
+      ScheduleExpression: "cron(0/15 * * * ? *)"
+      RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/edw-${pEnvironment}-dms-monitoring"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: !GetAtt DMSMonitoringLambdaFunction.Arn
+          Id: !Sub "edw-${pEnvironment}-dms-monitoring"
+                
+  DMSMonitoringSNSTopic:
+    Type: "AWS::SNS::Topic"
+    Condition: IsPrimary
+    Properties:
+      TopicName: !Sub "edw-${pEnvironment}-dms-monitoring"
+      
+  DMSSNSTopicEmailSubscription:
+    Type: "AWS::SNS::Subscription" 
+    Condition: IsPrimary    
+    Properties:
+      Protocol: "email"
+      Endpoint: !Ref EmailAddress
+      TopicArn: !Ref DMSMonitoringSNSTopic
+      
+Outputs:
+  DMSMonitoringLambdaFunction:
+    Description: "ARN of the DMS Monitoring Lambda function"
+    Condition: IsPrimary
+    Value: !Sub "edw-${pEnvironment}-dms-monitoring"
+  DMSMonitoringSNSTopic:
+    Description: ARN of the SNS topic
+    Condition: IsPrimary
+    Value: !Ref DMSMonitoringSNSTopic
+  DMSMonitoringIAMRole:
+    Description: "ARN of IAM role for DMS monitoring"
+    Condition: IsPrimary
+    Value: !Sub "edw-${pEnvironment}-dms-monitoring"
+  DMSMonitoringEventRule:  
+    Description: "ARN of Event Bridge rule for DMS Tasks Table Failures monitoring"
+    Condition: IsPrimary
+    Value: !Ref DMSMonitoringEventRule
+      
